@@ -93,7 +93,6 @@ if user_query:
         st.session_state.conversation_history = []
         st.session_state.adaptive_mode = False
         answer = "Conversation memory and adaptive mode have been cleared."
-
     else:
         start_time = time.time()
 
@@ -111,20 +110,20 @@ if user_query:
                 result = crew.kickoff()
 
             debug_logs = debug_buffer.getvalue()
-
             answer = str(result)
 
-            if st.session_state.adaptive_mode:
-                answer =  answer
             if debug_mode and debug_logs:
-                with st.expander("🔍  How the AI answered (Tool Trace)"):
+                with st.expander("🔍 How the AI answered (Tool Trace)"):
                     st.code(debug_logs)
 
             latency = round(time.time() - start_time, 2)
-
             st.caption(f"⏱ Response time: {latency} sec")
 
-            log_interaction(user_query, answer)
+            try:
+                log_interaction(user_query, answer)
+            except Exception as log_error:
+                if debug_mode:
+                    st.warning(f"Interaction log could not be saved: {log_error}")
 
             st.session_state.conversation_history.append({
                 "user": user_query,
@@ -139,7 +138,7 @@ if user_query:
                 "Please contact the front office for assistance."
             )
             if debug_mode:
-                st.error(f"Technical error: {error}")   # only for developer
+                st.error(f"Technical error: {error}")
             else:
                 st.warning("⚠️ Something went wrong. Please try again later.")
 
@@ -162,27 +161,40 @@ if user_query:
 if st.session_state.last_question and st.session_state.last_answer:
     st.markdown("---")
     st.subheader("Feedback")
+    st.caption("Your feedback helps improve future responses during this session.")
 
     col1, col2, col3 = st.columns(3)
 
     with col1:
         if st.button("👍 Helpful"):
-            log_feedback(
-                st.session_state.last_question,
-                st.session_state.last_answer,
-                "yes"
-            )
-            st.success("Thank you for the feedback.")
+            try:
+                log_feedback(
+                    st.session_state.last_question,
+                    st.session_state.last_answer,
+                    "yes"
+                )
+                st.success("Thank you for the feedback.")
+            except Exception as feedback_error:
+                if debug_mode:
+                    st.error(f"Feedback could not be saved: {feedback_error}")
+                else:
+                    st.warning("⚠️ Unable to save feedback right now.")
 
     with col2:
         if st.button("👎 Not Helpful"):
-            log_feedback(
-                st.session_state.last_question,
-                st.session_state.last_answer,
-                "no"
-            )
-            st.session_state.adaptive_mode = True
-            st.warning("Feedback noted. Future responses will be more cautious and explanatory.")
+            try:
+                log_feedback(
+                    st.session_state.last_question,
+                    st.session_state.last_answer,
+                    "no"
+                )
+                st.session_state.adaptive_mode = True
+                st.warning("Feedback noted. Future responses will be more cautious and explanatory.")
+            except Exception as feedback_error:
+                if debug_mode:
+                    st.error(f"Feedback could not be saved: {feedback_error}")
+                else:
+                    st.warning("⚠️ Unable to save feedback right now.")
 
     with col3:
         if st.button("Skip"):
