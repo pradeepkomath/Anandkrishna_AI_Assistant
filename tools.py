@@ -1,252 +1,201 @@
-import os
-import re
-from pathlib import Path
-from datetime import datetime
+import io
+import contextlib
+import time
 
-from dotenv import load_dotenv
-from crewai.tools import tool
+import streamlit as st
 
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import ChatPromptTemplate
-from typing import Any
+from crew_agent import build_crew, log_interaction, log_feedback
 
 
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
-
-FAISS_INDEX_PATH = (BASE_DIR / os.getenv("FAISS_INDEX_PATH", "vectorstore/faiss_index")).resolve()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-TOP_K = int(os.getenv("TOP_K", "4"))
-
-FRONT_OFFICE_CONTACT = "0487 2555869 / 9567566777"
-
-ROOM_TARIFFS = {
-    "premium": {"pax": 8, "plan": "A/C", "rate": 5775},
-    "suite": {"pax": 6, "plan": "A/C", "rate": 5250},
-    "4 bed deluxe": {"pax": 4, "plan": "A/C", "rate": 2888},
-    "4 bed": {"pax": 4, "plan": "A/C", "rate": 2625},
-    "2 bed": {"pax": 2, "plan": "A/C", "rate": 1838},
-}
+st.set_page_config(
+    page_title="Anandakrishna Residency AI Assistant",
+    page_icon="🏨",
+    layout="centered"
+)
 
 
-RAG_SYSTEM_PROMPT = """
-You are a customer support assistant for Anandakrishna Residency, Guruvayoor.
+# -----------------------------
+# Session State Initialization
+# -----------------------------
 
-Answer ONLY using the retrieved context.
+if "conversation_history" not in st.session_state:
+    st.session_state.conversation_history = []
 
-Rules:
-- Do not invent facts.
-- Do not confirm bookings, cancellations, availability, or negotiated quotations.
-- If information is missing, say it is not available in the current knowledge base.
-- Keep the answer polite and concise.
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-Retrieved context:
-{context}
-"""
+if "adaptive_mode" not in st.session_state:
+    st.session_state.adaptive_mode = False
 
-rag_prompt = ChatPromptTemplate.from_messages([
-    ("system", RAG_SYSTEM_PROMPT),
-    ("human", "{question}")
-])
+if "last_question" not in st.session_state:
+    st.session_state.last_question = None
 
-
-def _load_vectorstore():
-    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
-
-    if not FAISS_INDEX_PATH.exists():
-        return None
-
-    return FAISS.load_local(
-        str(FAISS_INDEX_PATH),
-        embeddings,
-        allow_dangerous_deserialization=True
-    )
+if "last_answer" not in st.session_state:
+    st.session_state.last_answer = None
 
 
-@tool("rag_knowledge_tool")
-def rag_knowledge_tool(description: Any = None, query: Any = None, input_text: Any = None) -> str:
-    """
-    Use this tool for informational questions about:
-    - hotel facilities
-    - Guruvayoor Temple timings
-    - poojas, festivals, and rush days
+# -----------------------------
+# Sidebar
+# -----------------------------
 
-    Do not use this tool for booking confirmation, cancellation, negotiation, or real-time availability.
-    """
-    raw_input = description or query or input_text or ""
+st.sidebar.title("⚙️ Assistant Settings")
 
-    if isinstance(raw_input, dict):
-        query = (
-            raw_input.get("description")
-            or raw_input.get("query")
-            or raw_input.get("input_text")
-            or ""
-        ).lower()
+debug_mode = st.sidebar.toggle(
+    "Show agent/tool execution details",
+    value=False
+)
+
+st.sidebar.markdown("---")
+st.sidebar.write("**Memory turns stored:**", len(st.session_state.conversation_history))
+
+if st.sidebar.button("Reset Memory & Adaptive Mode"):
+    st.session_state.conversation_history = []
+    st.session_state.messages = []
+    st.session_state.adaptive_mode = False
+    st.session_state.last_question = None
+    st.session_state.last_answer = None
+    st.rerun()
+
+
+# -----------------------------
+# Header
+# -----------------------------
+
+st.title("🏨 Anandakrishna Residency AI Assistant")
+st.caption("Ask about room tariffs, facilities, Guruvayoor Temple, availability, booking, or cancellation.")
+
+
+# -----------------------------
+# Display Chat History
+# -----------------------------
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
+
+
+# -----------------------------
+# Chat Input
+# -----------------------------
+
+user_query = st.chat_input("Type your question here...")
+
+if user_query:
+    st.session_state.messages.append({
+        "role": "user",
+        "content": user_query
+    })
+
+    with st.chat_message("user"):
+        st.write(user_query)
+
+    if user_query.lower() in ["reset", "clear memory", "new conversation"]:
+        st.session_state.conversation_history = []
+        st.session_state.adaptive_mode = False
+        answer = "Conversation memory and adaptive mode have been cleared."
     else:
-        query = str(raw_input).lower()
+        start_time = time.time()
 
-    
-    vectorstore = _load_vectorstore()
+        try:
+            crew = build_crew(
+                user_query,
+                debug_mode,
+                st.session_state.conversation_history,
+                st.session_state.adaptive_mode
+            )
 
-    if vectorstore is None:
-        return "Knowledge base is not available. Please run ingest.py before using this tool."
+            debug_buffer = io.StringIO()
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": TOP_K})
-    docs = retriever.invoke(query)
+            with contextlib.redirect_stdout(debug_buffer):
+                result = crew.kickoff()
 
-    if not docs:
-        return (
-            "The information is not available in the current knowledge base. "
-            f"Please contact the front office at {FRONT_OFFICE_CONTACT}."
-        )
+            debug_logs = debug_buffer.getvalue()
+            answer = str(result)
 
-    context = "\n\n".join(
-        f"[Source: {doc.metadata.get('source', 'unknown')}]\n{doc.page_content}"
-        for doc in docs
-    )
+            if debug_mode and debug_logs:
+                with st.expander("🔍 How the AI answered (Tool Trace)"):
+                    st.code(debug_logs)
 
-    llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0.2)
-    messages = rag_prompt.format_messages(context=context, question=query)
-    response = llm.invoke(messages)
+            latency = round(time.time() - start_time, 2)
+            st.caption(f"⏱ Response time: {latency} sec")
 
-    return response.content
+            try:
+                log_interaction(user_query, answer)
+            except Exception as log_error:
+                if debug_mode:
+                    st.warning(f"Interaction log could not be saved: {log_error}")
 
+            st.session_state.conversation_history.append({
+                "user": user_query,
+                "agent": answer
+            })
 
-@tool("availability_check_tool")
-def availability_check_tool(description: Any = None, query: Any = None, input_text: Any = None) -> str:
-    """
-    Use this tool only when the customer asks about room availability for a specific check-in date.
-    This is a mock availability checker for demonstration.
-    Odd date = rooms may be available.
-    Even date = rooms may be unavailable.
-    It must not confirm booking.
-    """
-    raw_input = description or query or input_text or ""
-    if isinstance(raw_input, dict):
-        query = (
-            raw_input.get("description")
-            or raw_input.get("query")
-            or raw_input.get("input_text")
-            or ""
-        )
-    else:
-        query = str(raw_input)
-    day = _extract_day_from_query(query)
+            st.session_state.conversation_history = st.session_state.conversation_history[-5:]
 
-    if day is None:
-        return (
-            "I need a check-in date to perform a preliminary availability check. "
-            f"Please contact the front office at {FRONT_OFFICE_CONTACT} for exact availability."
-        )
+        except Exception as error:
+            answer = (
+                "Sorry, I am unable to respond right now due to a technical issue. "
+                "Please contact the front office for assistance."
+            )
+            if debug_mode:
+                st.error(f"Technical error: {error}")
+            else:
+                st.warning("⚠️ Something went wrong. Please try again later.")
 
-    if day % 2 == 1:
-        return (
-            f"Preliminary availability check for day {day}: rooms may be available. "
-            "This is not a confirmed reservation. Please contact the front office for confirmation."
-        )
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": answer
+    })
 
-    return (
-        f"Preliminary availability check for day {day}: rooms may be limited or unavailable. "
-        "Please contact the front office for exact confirmation."
-    )
+    st.session_state.last_question = user_query
+    st.session_state.last_answer = answer
+
+    with st.chat_message("assistant"):
+        st.write(answer)
 
 
-@tool("human_escalation_tool")
-def human_escalation_tool(description: Any = None, query: Any = None, input_text: Any = None) -> str:
-    """
-    Use this tool for booking, cancellation, modification, group quotation, discount,
-    negotiation, complaint, or any business-impacting request.
-    """
-    raw_input = description or query or input_text or ""
-    if isinstance(raw_input, dict):
-        query = raw_input.get("description", "")   
-    else:
-        query = str(raw_input)
+# -----------------------------
+# Feedback Section
+# -----------------------------
 
-    # Query extraction is intentionally not used in the current version.
-    # This is kept for future enhancements such as intent-specific escalation handling.
-        
-    return (
-        "This request requires human staff assistance. "
-        f"Please contact Anandakrishna Residency front office at {FRONT_OFFICE_CONTACT}. "
-        "The AI assistant cannot confirm bookings, cancel reservations, modify bookings, "
-        "or provide negotiated quotations."
-    )
+if st.session_state.last_question and st.session_state.last_answer:
+    st.markdown("---")
+    st.subheader("Feedback")
+    st.caption("Your feedback helps improve future responses during this session.")
 
+    col1, col2, col3 = st.columns(3)
 
+    with col1:
+        if st.button("👍 Helpful"):
+            try:
+                log_feedback(
+                    st.session_state.last_question,
+                    st.session_state.last_answer,
+                    "yes"
+                )
+                st.success("Thank you for the feedback.")
+            except Exception as feedback_error:
+                if debug_mode:
+                    st.error(f"Feedback could not be saved: {feedback_error}")
+                else:
+                    st.warning("⚠️ Unable to save feedback right now.")
 
+    with col2:
+        if st.button("👎 Not Helpful"):
+            try:
+                log_feedback(
+                    st.session_state.last_question,
+                    st.session_state.last_answer,
+                    "no"
+                )
+                st.session_state.adaptive_mode = True
+                st.warning("Feedback noted. Future responses will be more cautious and explanatory.")
+            except Exception as feedback_error:
+                if debug_mode:
+                    st.error(f"Feedback could not be saved: {feedback_error}")
+                else:
+                    st.warning("⚠️ Unable to save feedback right now.")
 
-@tool("room_tariff_lookup_tool")
-def room_tariff_lookup_tool(description: Any = None, query: Any = None, input_text: Any = None) -> str:
-    """
-    Use this tool for room tariff, rate, price, rent, or pax capacity questions.
-    This tool gives structured tariff information for Anandakrishna Residency.
-    """
-    raw_input = description or query or input_text or ""
-    if isinstance(raw_input, dict):
-        text = (
-            raw_input.get("description")
-            or raw_input.get("query")
-            or raw_input.get("input_text")
-            or ""
-        ).lower()
-    else:
-        text = str(raw_input).lower()
-
-   
-
-    if "premium" in text or "8 bed" in text or "octaple" in text or "8 pax" in text or "8" in text or "8 person" in text:
-        room_type = "premium"
-    elif "suite" in text or "suit" in text or "6 bed" in text or "sextuple" in text or "6" in text:
-        room_type = "suite"
-    elif "4 bed deluxe" in text or "four bed deluxe" in text or "4" in text:
-        room_type = "4 bed deluxe"
-    elif "4 bed" in text or "four bed" in text or "4 pax" in text:
-        room_type = "4 bed"
-    elif "2 bed" in text or "two bed" in text or "double" in text or "2 pax" in text or "2" in text:
-        room_type = "2 bed"
-    else:
-        available = ", ".join(ROOM_TARIFFS.keys())
-        return (
-            "Please specify the room type. Available room types are: "
-            f"{available}."
-        )
-
-    details = ROOM_TARIFFS[room_type]
-
-    return (
-        f"The tariff for {room_type.upper()} room is ₹{details['rate']} per room. "
-        f"It is an {details['plan']} room with pax capacity of {details['pax']}. "
-        "Tariffs are subject to confirmation by the front office."
-    )
-
-def _extract_day_from_query(query: str):
-    text = query.lower()
-
-    # Matches dates like 01-06-2026, 1/6/2026, 1.6.2026
-    numeric_date = re.search(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})?\b", text)
-    if numeric_date:
-        return int(numeric_date.group(1))
-
-    # Matches "June 1", "June 1st", "1 June", "1st June"
-    month_names = (
-        "january|february|march|april|may|june|july|august|"
-        "september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec"
-    )
-
-    month_first = re.search(rf"\b({month_names})\s+(\d{{1,2}})(st|nd|rd|th)?\b", text)
-    if month_first:
-        return int(month_first.group(2))
-
-    day_first = re.search(rf"\b(\d{{1,2}})(st|nd|rd|th)?\s+({month_names})\b", text)
-    if day_first:
-        return int(day_first.group(1))
-
-    # Matches plain "on 1" or "date 1"
-    simple_day = re.search(r"\b(?:on|date|day)\s+(\d{1,2})\b", text)
-    if simple_day:
-        return int(simple_day.group(1))
-
-    return None
+    with col3:
+        if st.button("Skip"):
+            st.info("Feedback skipped.")
