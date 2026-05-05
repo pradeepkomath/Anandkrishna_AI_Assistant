@@ -1,7 +1,6 @@
-streamlit==1.35.0
+streamlit>=1.41.0
 
 crewai==1.6.1
-crewai-tools==1.6.1
 
 langchain==1.2.10
 langchain-openai==1.1.9
